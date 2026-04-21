@@ -23,7 +23,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
-
+extern int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+// Forward declaration
+// Forward declaration
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 // Find an index entry by path (linear scan).
@@ -135,12 +137,31 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
-}
+    index->count = 0;
 
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) return 0; // No index file yet — not an error
+
+    char hex[HASH_HEX_SIZE + 1];
+    while (index->count < MAX_INDEX_ENTRIES) {
+        IndexEntry *e = &index->entries[index->count];
+        memset(e, 0, sizeof(IndexEntry));
+
+        int matched = fscanf(f, "%o %64s %llu %u %511s\n",
+               &e->mode,
+               hex,
+               (unsigned long long *)&e->mtime_sec,
+               &e->size,
+               e->path);
+
+        if (matched != 5) break;
+
+        if (hex_to_hash(hex, &e->hash) < 0) break;
+        index->count++;
+    }
+    fclose(f);
+    return 0;
+}
 // Save the index to .pes/index atomically.
 //
 // HINTS - Useful functions and syscalls:
@@ -151,13 +172,39 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
-int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+static int compare_index_entries(const void *a, const void *b) {
+    return strcmp(((const IndexEntry *)a)->path, ((const IndexEntry *)b)->path);
 }
 
+int index_save(const Index *index) {
+    Index *sorted = malloc(sizeof(Index));
+    if (!sorted) return -1;
+    *sorted = *index;
+    qsort(sorted->entries, sorted->count, sizeof(IndexEntry), compare_index_entries);
+
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", INDEX_FILE);
+
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) { free(sorted); return -1; }
+
+    for (int i = 0; i < sorted->count; i++) {
+        const IndexEntry *e = &sorted->entries[i];
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&e->hash, hex);
+        fprintf(f, "%o %s %llu %u %s\n",
+                e->mode, hex,
+                (unsigned long long)e->mtime_sec,
+                e->size, e->path);
+    }
+
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    rename(tmp_path, INDEX_FILE);
+    free(sorted);
+    return 0;
+}
 // Stage a file for the next commit.
 //
 // HINTS - Useful functions and syscalls:
@@ -168,8 +215,47 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    // Step 1: Read file contents
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+
+    fseek(f, 0, SEEK_END);
+    size_t size = ftell(f);
+    rewind(f);
+
+    void *data = malloc(size);
+    if (!data) { fclose(f); return -1; }
+
+    size_t nread = fread(data, 1, size, f);
+    fclose(f);
+    if (nread != size) { free(data); return -1; }
+
+    // Step 2: Write as blob object
+    ObjectID hash;
+    if (object_write(OBJ_BLOB, data, size, &hash) < 0) {
+        free(data);
+        return -1;
+    }
+    free(data);
+
+    // Step 3: Get file metadata
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+
+    // Step 4: Find existing entry or create new one
+    IndexEntry *e = index_find(index, path);
+    if (!e) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
+        e = &index->entries[index->count++];
+        memset(e, 0, sizeof(IndexEntry));
+        strncpy(e->path, path, 511);
+        e->path[511] = '\0';
+    }
+
+    // Step 5: Update entry fields
+    e->hash = hash;
+    e->mode = (st.st_mode & S_IXUSR) ? 0100755 : 0100644;
+    e->mtime_sec = (uint64_t)st.st_mtime;
+    e->size = (uint32_t)size;
+    return index_save(index);
 }
