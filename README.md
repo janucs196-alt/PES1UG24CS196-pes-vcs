@@ -600,3 +600,49 @@ The following questions cover filesystem concepts beyond the implementation scop
 - **Git Internals** (Pro Git book): https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain
 - **Git from the inside out**: https://codewords.recurse.com/issues/two/git-from-the-inside-out
 - **The Git Parable**: https://tom.preston-werner.com/2009/05/19/the-git-parable.html
+
+## Analysis Questions
+
+### Q5.1 — How to implement pes checkout <branch>
+Files that change in .pes/: Update HEAD to "ref: refs/heads/<branch>".
+Read the commit hash from .pes/refs/heads/<branch>, walk the commit tree
+recursively, and write each blob's contents to the corresponding working
+directory path. Files that exist in the current branch but not the target
+must be deleted. The index must be fully replaced to reflect the target
+branch state. Complexity arises from: (1) detecting and deleting removed
+files, (2) protecting untracked files that would be overwritten, and
+(3) updating all index metadata atomically.
+
+### Q5.2 — Detecting dirty working directory conflicts
+For each entry in the index, call stat() on the actual file and compare
+stored mtime_sec and size against real values. A mismatch means the file
+is locally modified. Then check if the target branch tree has a different
+blob hash for that file. If both are true - local modification AND branch
+difference - refuse checkout and report the conflict. This avoids hashing
+at detection time; mtime+size is a fast dirty check.
+
+### Q5.3 — Detached HEAD and recovery
+In detached HEAD state, HEAD holds a raw commit hash instead of a branch
+ref. New commits update HEAD directly but no branch pointer moves.
+Switching branches leaves those commits unreachable by any ref. Recovery:
+the hash is printed at commit time. Run:
+  git branch recovery-branch <that-hash>
+to create a branch before the commits become unreachable garbage.
+
+### Q6.1 — Garbage Collection Algorithm
+Mark-and-sweep: (1) Mark phase - start from every file in
+.pes/refs/heads/, walk each commit parent chain, and for each commit
+visit its tree and all nested blobs recursively, inserting every hash
+into a hash set. (2) Sweep phase - enumerate all files under
+.pes/objects/ and delete any whose hash is absent from the set. For
+100k commits with 50 branches, assuming ~10 objects per commit, roughly
+1 million objects must be visited during the mark phase.
+
+### Q6.2 — GC Race Condition
+Race: GC scans at time T and marks a new blob as unreachable because no
+commit references it yet. A concurrent commit writes that blob at T but
+has not yet written the commit object. GC deletes the blob at T+1. The
+commit finishes at T+2 pointing to a now-deleted blob - repository
+corrupted. Git avoids this with a grace period (gc.pruneExpire = 2
+weeks): objects newer than 2 weeks are never deleted regardless of
+reachability, giving all in-progress operations time to complete safely.
